@@ -1,0 +1,20 @@
+﻿# Environment & secrets
+.env
+*.env
+
+# Virtual environment
+.venv/
+
+# ChromaDB store — large binary data, not source code
+chroma_db/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Analysis output
+AnalysisResults/
+
+# Test artifacts
+*.bak
