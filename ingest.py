@@ -1,260 +1,374 @@
 """
-ingest.py — Smart PDF ingestion pipeline
-Location: C:\Projects\wh40k-app\ingest.py
+ingest.py — Smart PDF ingestion pipeline (refactored)
+Location: C:\\Projects\\wh40k-app\\ingest.py
 Command:  python ingest.py
 
-Orchestrates the full segmentation pipeline across all PDFs and
-loads the resulting chunks directly into ChromaDB.
+Orchestrates the full segmentation pipeline across all PDFs and loads the
+resulting chunks directly into ChromaDB using the refactored module stack.
 
 Pipeline per PDF:
-  1. assess_pdf()                    — classify PDF type & select extraction strategy
-  2. segment_document_into_regions() — sub-page region detection + smart extraction
-  3. Enrich metadata                 — content_category, subject, doc_type from filename
-  4. Upsert into ChromaDB            — warhammer40k collection via Ollama embeddings
+  1. classify_filename()             — doc_type, subject, patrol_name, is_legends
+  2. assess_pdf()                    — classify PDF type & pick extraction strategy
+  3. segment_document_into_regions() — column-aware sub-page region detection
+  4. apply_carry_forward()           — section_type + section_identifier with
+                                       page/column resets (no bleed-through)
+  5. tag_chunks_with_faction()       — Munitorum-only: per-chunk faction tag
+  6. make_chunk_id()                 — content-addressable + versioned ID
+  7. flatten metadata                — schema main.py's filters expect
+  8. Upsert into ChromaDB            — warhammer40k collection via Ollama embeddings
+
+Config is read from env (see .env.example). The collection is nuked and
+recreated every run — same as the old pipeline. Incremental ingestion is
+deferred (see the TODO in chunk_ids.py).
 """
 
 import os
-import re
 import sys
 import logging
 from pathlib import Path
+from collections import Counter
 
+from dotenv import load_dotenv
 import chromadb
 from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
 
-# Add pdf_agent subfolder to path
+# Add pdf_agent subfolder to path so we can import the refactored modules
 sys.path.insert(0, str(Path(__file__).parent / "pdf_agent"))
+
 from pdf_agent import assess_pdf
 from pdf_region_segmenter import segment_document_into_regions
+from filename_classifier import classify_filename, FilenameMetadata
+from heading_classifier import apply_carry_forward
+from chunk_ids import get_or_create_run_id, make_chunk_id
+from munitorum_parser import tag_chunks_with_faction
+
+load_dotenv()
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
 )
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration — all overridable via .env
 # ---------------------------------------------------------------------------
 
-PDF_FOLDER      = r"C:\Personal Projects\warhammer_40k_pdfs"
-CHROMA_PATH     = r"C:\Projects\wh40k-app\chroma_db"
-COLLECTION_NAME = "warhammer40k"
+PDF_FOLDER      = os.getenv("PDF_FOLDER",      r"C:\Personal Projects\warhammer_40k_pdfs")
+CHROMA_PATH     = os.getenv("CHROMA_PATH",     r"C:\Projects\wh40k-app\chroma_db")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "warhammer40k")
+OLLAMA_URL      = os.getenv("OLLAMA_URL",      "http://127.0.0.1:11434/api/embeddings")
+OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "nomic-embed-text")
+BATCH_SIZE      = int(os.getenv("INGEST_BATCH_SIZE", "100"))
+
 
 # ---------------------------------------------------------------------------
 # ChromaDB — delete and recreate for a clean ingest
 # ---------------------------------------------------------------------------
 
-embedding_fn = OllamaEmbeddingFunction(
-    url="http://127.0.0.1:11434/api/embeddings",
-    model_name="nomic-embed-text"
-)
+def make_collection():
+    embedding_fn = OllamaEmbeddingFunction(url=OLLAMA_URL, model_name=OLLAMA_MODEL)
+    client = chromadb.PersistentClient(path=CHROMA_PATH)
+    existing = [c.name for c in client.list_collections()]
+    if COLLECTION_NAME in existing:
+        log.info(f"Deleting existing collection '{COLLECTION_NAME}' for clean re-ingest...")
+        client.delete_collection(name=COLLECTION_NAME)
+    collection = client.create_collection(
+        name=COLLECTION_NAME, embedding_function=embedding_fn,
+    )
+    log.info(f"Created fresh collection '{COLLECTION_NAME}'")
+    return collection
 
-client = chromadb.PersistentClient(path=CHROMA_PATH)
-
-existing = [c.name for c in client.list_collections()]
-if COLLECTION_NAME in existing:
-    log.info(f"Deleting existing collection '{COLLECTION_NAME}' for clean re-ingest...")
-    client.delete_collection(name=COLLECTION_NAME)
-
-collection = client.create_collection(
-    name=COLLECTION_NAME,
-    embedding_function=embedding_fn
-)
-log.info(f"Created fresh collection '{COLLECTION_NAME}'")
 
 # ---------------------------------------------------------------------------
-# Filename metadata helpers
+# Record builders — kept in ingest.py (not a module) because they're the
+# contract between the pipeline and ChromaDB's schema requirements.
+#
+# ChromaDB requires metadata values to be str / int / float / bool. Any
+# None value in the nested metadata must be coerced. We do this explicitly
+# field-by-field rather than with a generic coercer so the schema is
+# self-documenting and grep-able.
 # ---------------------------------------------------------------------------
 
-CATEGORY_RULES = [
-    (r"core rules updates",           "core_rules_updates"),
-    (r"core rules",                   "core_rules"),
-    (r"quick start",                  "core_rules_quickstart"),
-    (r"combat patrol rules",          "combat_patrol_rules"),
-    (r"crusade rules",                "crusade_rules"),
-    (r"boarding actions",             "boarding_actions_rules"),
-    (r"chapter approved.*tournament", "tournament_rules"),
-    (r"pariah nexus.*tournament",     "tournament_rules"),
-    (r"balance dataslate",            "balance_rules"),
-    (r"munitorum",                    "points_costs"),
-    (r"army roster",                  "army_roster"),
-    (r"combat patrol",                "combat_patrol"),
-    (r"faction pack",                 "faction_rules"),
-    (r"imperial armour",              "imperial_armour"),
-]
-
-def extract_content_category(filename: str) -> str:
-    name = filename.lower()
-    for pattern, category in CATEGORY_RULES:
-        if re.search(pattern, name):
-            return category
-    return "other"
-
-def extract_doc_type(filename: str) -> str:
-    name = filename.lower()
-    if re.search(r"combat patrol rules", name): return "combat_patrol_rules"
-    if re.search(r"combat patrol",       name): return "combat_patrol"
-    if re.search(r"faction pack",        name): return "faction_pack"
-    if re.search(r"core rules",          name): return "core_rules"
-    if re.search(r"balance dataslate",   name): return "balance_dataslate"
-    if re.search(r"imperial armour",     name): return "imperial_armour"
-    if re.search(r"army roster",         name): return "army_roster"
-    if re.search(r"munitorum",           name): return "munitorum"
-    return "other"
-
-def extract_subject(filename: str) -> str:
-    name = filename.lower().replace(".pdf", "").strip()
-    for prefix in ("combat patrol - ", "faction pack - ", "imperial armour - "):
-        if name.startswith(prefix):
-            return name[len(prefix):].strip()
-    return name
-
-# ---------------------------------------------------------------------------
-# ChromaDB metadata flattening
-# ---------------------------------------------------------------------------
-
-def flatten_metadata(chunk: dict, doc_type: str, content_category: str, subject: str) -> dict:
+def build_embedding_text(chunk: dict) -> str:
     """
-    ChromaDB requires all metadata values to be str, int, float, or bool.
-    Flatten the nested metadata dict and add filename-derived fields.
+    What actually goes to the embedding model.
+
+    When the heading classifier is confident about the chunk's heading, we
+    prepend it so the embedding captures the section context. When it isn't,
+    we send the raw text — prefixing with a wrong heading poisons the vector
+    more than missing context hurts it.
+
+    Note: we intentionally do NOT prepend doc_type / subject. Those live in
+    metadata and are applied as filters at query time. Prepending them to
+    the embedding text was the old pipeline's approach and it added noise
+    to the vector without improving filter precision (filters are exact).
     """
-    raw = chunk.get("metadata", {})
+    text = chunk.get("text", "")
+    classification = chunk.get("classification")
+    if classification and classification.confident and classification.heading:
+        return f"[{classification.heading}]\n{text}"
+    return text
+
+
+def flatten_chunk_metadata(chunk: dict, fm: FilenameMetadata) -> dict:
+    """
+    Produce a ChromaDB-safe flat metadata dict.
+
+    The keys here MUST match the filter keys main.py's extract_filters()
+    emits: subject, doc_type, patrol_name, munitorum_faction. Any rename
+    breaks retrieval silently. Diagnostic fields (content_type, word_count,
+    etc.) are included for /db-info and debugging but aren't queried.
+    """
+    inner = chunk.get("metadata", {}) or {}
+    classification = chunk.get("classification")
+
     return {
-        # Top-level chunk fields
-        "source":                   chunk.get("source_file", ""),
+        # --- Filter-critical: main.py queries these ---
+        "doc_type":                 fm.doc_type,
+        "subject":                  fm.subject,
+        "patrol_name":              fm.patrol_name,
+        "munitorum_faction":        inner.get("munitorum_faction", ""),
+
+        # --- Filename-level ---
+        "is_legends":               bool(fm.is_legends),
+
+        # --- Chunk identity / provenance ---
+        "source":                   str(chunk.get("source_file", "")),
         "page_number":              int(chunk.get("page_number", 0)),
         "region_index":             int(chunk.get("region_index", 0)),
         "chunk_index":              int(chunk.get("chunk_index", 0)),
-        "section_type":             chunk.get("section_type", "general"),
-        "section_identifier":       chunk.get("section_identifier", ""),
-        "section_identifier_clean": chunk.get("section_identifier_clean", ""),
-        "extraction_method":        chunk.get("extraction_method", ""),
-        "content_type":             chunk.get("content_type", "text"),
-        # Filename-derived
-        "doc_type":                 doc_type,
-        "content_category":         content_category,
-        "subject":                  subject,
-        # From nested metadata
-        "pdf_type":                 str(raw.get("pdf_type", "")),
-        "total_pages":              int(raw.get("total_pages", 0)),
-        "char_count":               int(raw.get("char_count", 0)),
-        "word_count":               int(raw.get("word_count", 0)),
-        "has_tables":               bool(raw.get("has_tables", False)),
-        "has_images":               bool(raw.get("has_images", False)),
-        "ocr_confidence":           float(raw.get("ocr_confidence") or 0.0),
-        "geometric_source":         str(raw.get("geometric_source", "")),
-        "content_confirmed":        bool(raw.get("content_confirmed", False)),
-        "is_pure_artwork":          bool(raw.get("is_pure_artwork", False)),
-        "title":                    str(raw.get("title") or ""),
-        "author":                   str(raw.get("author") or ""),
+        "column_label":             str(chunk.get("column_label", "single")),
+
+        # --- Classification (from heading_classifier + carry-forward) ---
+        "section_type":             str(chunk.get("section_type", "general")),
+        "section_identifier":       str(chunk.get("section_identifier", "")),
+        "classification_confident": bool(
+            classification.confident if classification else False
+        ),
+
+        # --- Extraction diagnostics ---
+        "content_type":             str(chunk.get("content_type", "text")),
+        "extraction_method":        str(chunk.get("extraction_method", "")),
+        "geometric_source":         str(chunk.get("geometric_source", "")),
+        "content_confirmed":        bool(chunk.get("content_confirmed", False)),
+        "is_pure_artwork":          bool(chunk.get("is_pure_artwork", False)),
+        "word_count":               int(chunk.get("word_count", 0)),
+        "table_count":              int(chunk.get("table_count", 0)),
+        "ocr_confidence":           float(chunk.get("ocr_confidence") or 0.0),
+
+        # --- PDF-level (from the segmenter's nested metadata) ---
+        "pdf_type":                 str(inner.get("pdf_type", "")),
+        "total_pages":              int(inner.get("total_pages", 0)),
+        "char_count":               int(inner.get("char_count", 0)),
+        "has_tables":               bool(inner.get("has_tables", False)),
+        "has_images":               bool(inner.get("has_images", False)),
+        "title":                    str(inner.get("title") or ""),
+        "author":                   str(inner.get("author") or ""),
     }
 
+
+def build_records(chunks: list, fm: FilenameMetadata) -> tuple:
+    """
+    Turn chunks into (ids, documents, metadatas) triples ready for upsert.
+    Also de-duplicates chunk IDs defensively: if two chunks produce the same
+    ID, we keep the first and warn. This shouldn't happen given the whitespace
+    normalization in make_chunk_id, but a second collision would silently
+    overwrite a chunk otherwise.
+    """
+    ids, documents, metadatas = [], [], []
+    seen = set()
+    dupes = 0
+    for c in chunks:
+        cid = make_chunk_id(
+            source_file=c.get("source_file", ""),
+            page_number=int(c.get("page_number", 0)),
+            text=c.get("text", ""),
+        )
+        if cid in seen:
+            dupes += 1
+            continue
+        seen.add(cid)
+        ids.append(cid)
+        documents.append(build_embedding_text(c))
+        metadatas.append(flatten_chunk_metadata(c, fm))
+    if dupes:
+        log.warning(f"  [DEDUP-ID] dropped {dupes} chunk(s) with duplicate IDs")
+    return ids, documents, metadatas
+
+
 # ---------------------------------------------------------------------------
-# Ingestion
+# pdfplumber fallback — used when segment_document_into_regions crashes
 # ---------------------------------------------------------------------------
 
-def ingest_pdfs(folder: str):
-    pdf_files = sorted([f for f in os.listdir(folder) if f.endswith(".pdf")])
+def pdfplumber_fallback(filepath: str) -> list:
+    """
+    Dumbest-possible text extraction so a segmenter crash doesn't lose a PDF
+    entirely. Produces chunk dicts compatible with the normal pipeline schema
+    (minus column_label — set to "single" — and with a trivial classification).
+
+    Returns an empty list on complete failure; the caller will then skip the PDF.
+    """
+    try:
+        import pdfplumber
+    except Exception as e:
+        log.error(f"  pdfplumber unavailable for fallback: {e}")
+        return []
+
+    try:
+        from heading_classifier import classify_chunk
+    except Exception:
+        classify_chunk = None
+
+    chunks = []
+    try:
+        with pdfplumber.open(filepath) as pdf:
+            for page_num, page in enumerate(pdf.pages, start=1):
+                text = page.extract_text() or ""
+                if not text.strip():
+                    continue
+                classification = classify_chunk(text) if classify_chunk else None
+                chunks.append({
+                    "source_file":        filepath,
+                    "page_number":        page_num,
+                    "region_index":       0,
+                    "chunk_index":        0,
+                    "column_label":       "single",
+                    "text":               text,
+                    "content_type":       "text",
+                    "extraction_method":  "pdfplumber_fallback",
+                    "bbox":               [0, 0, 0, 0],
+                    "geometric_source":   "fallback",
+                    "content_confirmed":  False,
+                    "ocr_confidence":     0.0,
+                    "table_count":        0,
+                    "word_count":         len(text.split()),
+                    "is_pure_artwork":    False,
+                    "statlines":          [],
+                    "classification":     classification,
+                    "section_type":       "general",
+                    "section_identifier": "",
+                    "metadata":           {},
+                })
+    except Exception as e:
+        log.error(f"  pdfplumber fallback failed: {type(e).__name__}: {e}")
+        return []
+    return chunks
+
+
+# ---------------------------------------------------------------------------
+# Main ingest
+# ---------------------------------------------------------------------------
+
+def ingest_pdfs(folder: str) -> None:
+    if not os.path.isdir(folder):
+        log.error(f"PDF folder does not exist: {folder}")
+        sys.exit(1)
+
+    pdf_files = sorted(f for f in os.listdir(folder) if f.lower().endswith(".pdf"))
+    if not pdf_files:
+        log.error(f"No PDFs found in {folder}")
+        sys.exit(1)
+
+    run_id = get_or_create_run_id()
+    log.info(f"Ingest run_id = {run_id}")
     log.info(f"Found {len(pdf_files)} PDFs to ingest from {folder}")
 
+    collection = make_collection()
+
     total_chunks = 0
-    failed       = []
+    doc_type_counts = Counter()
+    subject_counts = Counter()
+    failed = []
 
     for i, filename in enumerate(pdf_files, 1):
-        filepath         = os.path.join(folder, filename)
-        doc_type         = extract_doc_type(filename)
-        content_category = extract_content_category(filename)
-        subject          = extract_subject(filename)
+        filepath = os.path.join(folder, filename)
+        fm = classify_filename(filename)
+        log.info(
+            f"[{i}/{len(pdf_files)}] {filename} "
+            f"| doc_type={fm.doc_type} subject={fm.subject!r} "
+            f"patrol={fm.patrol_name!r}"
+        )
 
-        log.info(f"[{i}/{len(pdf_files)}] {filename}")
-        log.info(f"  category={content_category} | subject={subject}")
-
+        # ---- Segment (with fallback) ----
         try:
-            assessment        = assess_pdf(filepath)
+            assessment = assess_pdf(filepath)
             chunks, statlines = segment_document_into_regions(filepath, assessment)
+            if not chunks:
+                log.warning("  segment produced 0 chunks — trying pdfplumber fallback")
+                chunks = pdfplumber_fallback(filepath)
+                statlines = []
         except BaseException as e:
-            log.warning(f"  Segmentation failed ({type(e).__name__}: {e}) — trying pdfplumber fallback")
-            try:
-                import pdfplumber
-                chunks, statlines = [], []
-                with pdfplumber.open(filepath) as pdf:
-                    for page_num, page in enumerate(pdf.pages, start=1):
-                        text = page.extract_text() or ""
-                        if text.strip():
-                            chunks.append({
-                                "chunk_id":   f"{Path(filename).stem}_p{page_num:04d}_r00_c000",
-                                "source_file": filepath,
-                                "page_number": page_num,
-                                "region_index": 0,
-                                "chunk_index": 0,
-                                "section_type": "general",
-                                "section_identifier": "",
-                                "section_identifier_clean": "",
-                                "extraction_method": "pdfplumber_fallback",
-                                "content_type": "text",
-                                "text": text,
-                                "metadata": {},
-                            })
-                log.info(f"  Fallback produced {len(chunks)} chunks")
-            except BaseException as e2:
-                log.error(f"  Fallback also failed: {e2} — skipping {filename}")
-                failed.append(filename)
-                continue
+            log.warning(
+                f"  segmentation failed ({type(e).__name__}: {e}) "
+                f"— trying pdfplumber fallback"
+            )
+            chunks = pdfplumber_fallback(filepath)
+            statlines = []
 
         if not chunks:
-            log.warning(f"  No chunks produced — skipping")
+            log.error(f"  no chunks produced — skipping {filename}")
+            failed.append(filename)
             continue
 
-        # ── Forward-pass: carry section headings into every chunk ──
-        current_heading = ""
-        for c in chunks:
-            sid = c.get("section_identifier", "").strip()
-            if sid and sid.lower() not in ("general", "narrative", ""):
-                current_heading = sid
-            if current_heading:
-                c["_heading"] = current_heading
-            else:
-                c["_heading"] = ""
+        # ---- Carry-forward: page/column-aware heading propagation ----
+        # Mutates chunks in place; produces final section_type / section_identifier.
+        apply_carry_forward(chunks)
 
-        ids    = [c["chunk_id"] for c in chunks]
-        # Embed with: [category | subject | heading] + text
-        # This ensures every chunk is self-identifying in vector space
-        documents = []
-        for c in chunks:
-            heading = c.get("_heading", "")
-            prefix  = f"[{content_category} | {subject}]"
-            if heading:
-                prefix += f" [{heading}]"
-            documents.append(prefix + "\n" + c["text"])
-        metadatas = [
-            flatten_metadata(c, doc_type, content_category, subject)
-            for c in chunks
-        ]
+        # ---- Munitorum-only: tag every chunk with its faction ----
+        # Intentionally scoped to points_costs so a bug here can't corrupt
+        # every other PDF's metadata. The tagger is also strictly additive:
+        # it only writes `munitorum_faction` into chunk["metadata"], so
+        # other keys are unaffected.
+        if fm.doc_type == "points_costs":
+            try:
+                tag_chunks_with_faction(chunks)
+            except Exception as e:
+                log.warning(
+                    f"  [MUNITORUM] tagging failed ({type(e).__name__}: {e}) "
+                    f"— continuing with empty munitorum_faction"
+                )
 
-        # Upsert in batches of 100
-        batch_size = 100
-        for start in range(0, len(chunks), batch_size):
-            end = start + batch_size
-            collection.upsert(
-                documents=documents[start:end],
-                ids=ids[start:end],
-                metadatas=metadatas[start:end],
-            )
+        # ---- Build records ----
+        ids, documents, metadatas = build_records(chunks, fm)
+        if not ids:
+            log.warning(f"  all chunks collapsed by dedup — skipping {filename}")
+            failed.append(filename)
+            continue
 
-        log.info(f"  -> {len(chunks)} chunks upserted | {len(statlines)} statlines")
-        total_chunks += len(chunks)
+        # ---- Upsert in batches ----
+        try:
+            for start in range(0, len(ids), BATCH_SIZE):
+                end = start + BATCH_SIZE
+                collection.upsert(
+                    ids=ids[start:end],
+                    documents=documents[start:end],
+                    metadatas=metadatas[start:end],
+                )
+        except Exception as e:
+            log.error(f"  upsert failed ({type(e).__name__}: {e}) — skipping {filename}")
+            failed.append(filename)
+            continue
 
+        total_chunks += len(ids)
+        doc_type_counts[fm.doc_type] += 1
+        subject_counts[fm.subject] += 1
+        log.info(f"  -> {len(ids)} chunks upserted | {len(statlines)} statlines")
+
+    # ---- Summary ----
     print(f"\n{'='*60}")
-    print(f"  INGESTION COMPLETE")
+    print(f"  INGESTION COMPLETE  (run_id={run_id})")
     print(f"{'='*60}")
     print(f"  PDFs processed : {len(pdf_files) - len(failed)}")
     print(f"  Failed         : {len(failed)}")
-    if failed:
-        for f in failed:
-            print(f"    - {f}")
+    for f in failed:
+        print(f"    - {f}")
     print(f"  Total chunks   : {collection.count():,}")
+    print(f"  doc_type mix   : {dict(doc_type_counts)}")
+    top_subjects = subject_counts.most_common(10)
+    print(f"  top subjects   : {top_subjects}")
     print(f"{'='*60}\n")
+
 
 if __name__ == "__main__":
     ingest_pdfs(PDF_FOLDER)
