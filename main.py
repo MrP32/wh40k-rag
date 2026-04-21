@@ -31,7 +31,7 @@ collection    = chroma_client.get_collection(
 )
 
 anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL      = "claude-sonnet-4-20250514"
+MODEL      = "claude-sonnet-4-6"
 MAX_TOKENS = 1024
 
 app = FastAPI()
@@ -40,65 +40,156 @@ class ChatRequest(BaseModel):
     messages: list[dict]
 
 FILTER_PROMPT = """You are a metadata extractor for a Warhammer 40,000 rules database.
-Given a user query, extract structured search filters as JSON.
+Extract structured search filters from the user's query and return them as JSON.
 
-Available doc_type values (pick the ONE that best matches):
-  combat_patrol            — a specific named combat patrol box
-  combat_patrol_rules      — the universal combat patrol rulebook
-  faction_pack             — a faction's rules pack (detachments, stratagems, datasheets)
-  core_rules               — the main core rules
-  core_rules_updates       — rolling patch document to core rules
-  core_rules_quickstart    — beginner's short rules
-  points_costs             — the Munitorum Field Manual (points for all factions)
-  balance_dataslate        — the rolling balance patch
-  crusade_rules            — narrative/campaign rules
-  boarding_actions_rules   — boarding-actions game mode
-  tournament_rules         — Chapter Approved / Pariah Nexus tournament packs
-  imperial_armour          — Imperial Armour / Forge World rules
-  army_roster              — army roster templates
-  other                    — anything else
+Your job is to be HELPFUL, not cautious. If the query clearly refers to a
+specific faction, rulebook, or document type, extract that information even
+if the wording is colloquial, informal, or uses synonyms. Partial filters
+are valuable: extracting just "subject" for a query like "tell me about
+Stormboyz" is much better than returning {} and falling back to unfiltered
+search.
 
-Available subject values (always lowercase, codex-faction level — NEVER a
-sub-chapter like 'ultramarines' or a patrol box name):
+Only return {} when the query is genuinely generic (e.g. "what is a
+stratagem?", "how does the game work?") with no extractable faction,
+rulebook, or document-type signal.
+
+=============================================================================
+AVAILABLE doc_type VALUES — pick the ONE that best matches
+=============================================================================
+  combat_patrol            a specific named combat patrol box
+  combat_patrol_rules      the universal combat patrol rulebook
+  faction_pack             a faction's rules (detachments, stratagems, datasheets)
+  core_rules               the main core rules
+  core_rules_updates       rolling patch document to core rules
+  core_rules_quickstart    beginner's short rules
+  points_costs             the Munitorum Field Manual (points for all factions)
+  balance_dataslate        the rolling balance patch
+  crusade_rules            narrative/campaign rules
+  boarding_actions_rules   boarding-actions game mode
+  tournament_rules         Chapter Approved / Pariah Nexus tournament packs
+  imperial_armour          Imperial Armour / Forge World rules
+  army_roster              army roster templates
+  other                    anything else
+
+=============================================================================
+AVAILABLE subject VALUES — always lowercase, always the codex faction
+=============================================================================
+NEVER use sub-chapters like 'ultramarines', 'raven guard', 'iron hands',
+'salamanders', 'white scars', 'imperial fists' — those all roll up to
+'space marines'.
+
   space marines, grey knights, blood angels, dark angels, black templars,
   space wolves, deathwatch, adepta sororitas, adeptus custodes,
   adeptus mechanicus, astra militarum, imperial knights, imperial agents,
   chaos space marines, death guard, thousand sons, world eaters,
-  emperor's children, chaos knights, chaos daemons,
-  aeldari, drukhari, genestealer cults, leagues of votann, necrons, orks,
-  t'au empire, tyranids,
+  emperor's children, chaos knights, chaos daemons, aeldari, drukhari,
+  genestealer cults, leagues of votann, necrons, orks, t'au empire, tyranids,
   core rules, munitorum field manual, balance dataslate, combat patrol rules,
   crusade rules, boarding actions
 
-Output fields (all OPTIONAL — omit any you cannot confidently determine):
-  doc_type           — from the list above
-  subject            — from the list above; always the codex faction or the
-                       rulebook name, NEVER a patrol box, stratagem, or unit name
-  patrol_name        — ONLY for a specific named combat patrol box, e.g.
-                       "aurellios banishers". Use together with subject.
-  munitorum_faction  — ONLY for points-cost queries; the faction whose points
-                       the user wants, e.g. "grey knights" for "Nemesis
-                       Dreadknight points"
+=============================================================================
+OUTPUT FIELDS (all optional)
+=============================================================================
+  doc_type           from the doc_type list above
+  subject            from the subject list above
+  patrol_name        ONLY for a specific named combat patrol box, e.g.
+                     "aurellios banishers". Use together with subject.
+  munitorum_faction  ONLY for points-cost queries; the faction whose points
+                     the user wants, e.g. "grey knights"
 
-Return ONLY valid JSON. Return {} if no field can be confidently determined.
+=============================================================================
+ROUTING GUIDE — when you see these signals, pick these fields
+=============================================================================
+POINTS-COST queries — ALWAYS set doc_type=points_costs AND munitorum_faction.
+  Signals: "points", "cost", "pts", "how many points", "how much does X cost",
+  "what's the point value", "how expensive", "points value", "points for",
+  "cost of", "price of", numeric questions about army-building costs.
+  The munitorum_faction is the faction the *unit* belongs to, not the player.
 
-Examples:
-  "Grey Knights stratagems"
-    -> {"subject": "grey knights", "doc_type": "faction_pack"}
-  "Librarius Conclave rules"
-    -> {"subject": "space marines", "doc_type": "faction_pack"}
-  "How does overwatch work?"
-    -> {"doc_type": "core_rules"}
+FACTION-RULES queries — set subject, and usually doc_type=faction_pack.
+  Signals: a faction name + any of: "stratagems", "detachment", "detachment
+  rule", "enhancements", "army rule", "datasheet", "weapons", "abilities",
+  "keyword", "what does X do". Also: named detachments ("Librarius Conclave",
+  "Warpbane Task Force") → their parent faction, doc_type=faction_pack.
+  Named universal abilities ("Teleport Assault", "Oath of Moment") → their
+  parent faction (subject only; skip doc_type if unsure).
+
+COMBAT-PATROL queries — set subject, patrol_name, doc_type=combat_patrol.
+  Signals: "combat patrol" + faction, or a specific patrol box name
+  ("Aurellios Banishers", "Warpbane Task Force" is NOT a patrol — it's a
+  detachment). Patrol names typically end in "Banishers", "Host", "Cadre",
+  "Guardians", "Brood", "Strike Team", "Kill Team", etc.
+
+CORE-RULES queries — set doc_type=core_rules.
+  Signals: universal rules language ("overwatch", "charge", "morale",
+  "objective control", "how does X phase work", "what's the rule for X").
+
+UNIT-BY-NAME queries — set subject if the unit is unambiguous.
+  "Stormboyz" → orks. "Nemesis Dreadknight" → grey knights. "Leman Russ"
+  → astra militarum. "Wraithlord" → aeldari.
+
+=============================================================================
+EXAMPLES — showing PHRASING VARIANTS for the same underlying intent
+=============================================================================
+Points costs (all these must extract both doc_type AND munitorum_faction):
   "Points cost for a Leman Russ"
     -> {"doc_type": "points_costs", "munitorum_faction": "astra militarum"}
   "How many points is a Nemesis Dreadknight?"
     -> {"doc_type": "points_costs", "munitorum_faction": "grey knights"}
-  "Aurellios Banishers combat patrol"
-    -> {"subject": "grey knights", "patrol_name": "aurellios banishers", "doc_type": "combat_patrol"}
+  "How much does a Carnifex cost?"
+    -> {"doc_type": "points_costs", "munitorum_faction": "tyranids"}
+  "What's the points value of a Ghazghkull?"
+    -> {"doc_type": "points_costs", "munitorum_faction": "orks"}
+  "Baneblade pts"
+    -> {"doc_type": "points_costs", "munitorum_faction": "astra militarum"}
+  "cost of a wraithknight"
+    -> {"doc_type": "points_costs", "munitorum_faction": "aeldari"}
+
+Faction rules (all extract both subject AND doc_type):
+  "Grey Knights stratagems"
+    -> {"subject": "grey knights", "doc_type": "faction_pack"}
+  "What are the Grey Knights stratagems?"
+    -> {"subject": "grey knights", "doc_type": "faction_pack"}
+  "Show me Tyranid enhancements"
+    -> {"subject": "tyranids", "doc_type": "faction_pack"}
+  "Librarius Conclave detachment rule"
+    -> {"subject": "space marines", "doc_type": "faction_pack"}
+  "Warpbane Task Force"
+    -> {"subject": "grey knights", "doc_type": "faction_pack"}
+  "What does Oath of Moment do?"
+    -> {"subject": "space marines", "doc_type": "faction_pack"}
+
+Unit by name (subject only when doc_type is ambiguous):
   "Teleport Assault rule"
     -> {"subject": "grey knights"}
+  "What weapons does a Strike Squad have?"
+    -> {"subject": "grey knights", "doc_type": "faction_pack"}
+  "Tell me about Stormboyz"
+    -> {"subject": "orks"}
+
+Combat patrols (subject + patrol_name + doc_type):
+  "Aurellios Banishers combat patrol"
+    -> {"subject": "grey knights", "patrol_name": "aurellios banishers", "doc_type": "combat_patrol"}
+  "Grey Knights combat patrol"
+    -> {"subject": "grey knights", "doc_type": "combat_patrol"}
+  "Sanctuary Guardians"
+    -> {"subject": "adepta sororitas", "patrol_name": "sanctuary guardians", "doc_type": "combat_patrol"}
+
+Core rules:
+  "How does overwatch work?"
+    -> {"doc_type": "core_rules"}
+  "What's the rule for charging?"
+    -> {"doc_type": "core_rules"}
+
+Genuinely generic — these return {}:
   "What is a stratagem?"
     -> {}
+  "How do I play Warhammer 40k?"
+    -> {}
+  "What's the best faction?"
+    -> {}
+
+Return ONLY valid JSON. No preamble, no code fences, no explanation.
 """
 
 def extract_filters(query: str) -> dict:
@@ -110,7 +201,7 @@ def extract_filters(query: str) -> dict:
     try:
         resp = anthropic_client.messages.create(
             model=MODEL,
-            max_tokens=200,   # bumped from 100 to fit larger JSON responses
+            max_tokens=300,   # bumped from 200 for the expanded filter prompt
             messages=[{"role": "user", "content": f"{FILTER_PROMPT}\n\nQuery: {query}"}]
         )
         data = json.loads(resp.content[0].text.strip())

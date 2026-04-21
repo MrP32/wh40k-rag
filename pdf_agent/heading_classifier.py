@@ -166,11 +166,52 @@ class HeadingResult:
 # Classification
 # ---------------------------------------------------------------------------
 
+# Section-marker prefixes that sometimes get concatenated onto the real heading
+# line by PDF extraction (e.g. "DEFAULT SECONDARY OBJECTIVE VANGUARD STRIKE"
+# instead of two separate lines). When a candidate heading STARTS with one of
+# these markers, strip the marker and treat the remainder as the real heading.
+# Order matters: longer prefixes must match before their shorter substrings.
+_CONCATENATED_MARKER_PREFIXES = (
+    "DEFAULT SECONDARY OBJECTIVE",
+    "OPTIONAL SECONDARY OBJECTIVE",
+    "SECONDARY OBJECTIVES",
+    "PRIMARY OBJECTIVE",
+    "DEFAULT ENHANCEMENT",
+    "OPTIONAL ENHANCEMENT",
+    "ENHANCEMENTS",
+    "DETACHMENT RULE",
+)
+
+
+def _strip_marker_prefix(line: str) -> str:
+    """
+    If `line` starts with a section marker that got PDF-concatenated onto
+    the real heading (e.g. "DEFAULT SECONDARY OBJECTIVE VANGUARD STRIKE"),
+    return just the trailing heading ("VANGUARD STRIKE"). Otherwise return
+    the line unchanged.
+    """
+    stripped = line.strip()
+    for prefix in _CONCATENATED_MARKER_PREFIXES:
+        # Require the prefix + at least one word of heading content,
+        # separated by whitespace. An exact equality with the prefix means
+        # this IS the marker, not a marker-plus-heading, so leave it for
+        # the classifier's marker-matching logic to handle.
+        if stripped.startswith(prefix + " ") and len(stripped) > len(prefix) + 1:
+            return stripped[len(prefix):].strip()
+    return stripped
+
+
 def _find_candidates(text: str) -> list:
     """Return all candidate headings (allcaps lines, 2-6 words, not in denylist)."""
     candidates = []
     for m in _CANDIDATE_HEADING_LINE.finditer(text):
-        line = m.group(0).strip()
+        # Strip any concatenated section-marker prefix before applying checks.
+        # This turns "DEFAULT SECONDARY OBJECTIVE VANGUARD STRIKE" into just
+        # "VANGUARD STRIKE" for the purposes of candidate extraction, while
+        # still leaving the original text intact for marker-based classifiers
+        # (which use re.search independently).
+        original = m.group(0).strip()
+        line = _strip_marker_prefix(original)
         words = line.split()
         if not (2 <= len(words) <= 6):
             continue
