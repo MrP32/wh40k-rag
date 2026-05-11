@@ -5,13 +5,25 @@
 ## What this branch does
 
 Adds a desktop-app feel on top of the existing FastAPI + ChromaDB backend,
-without touching the retrieval pipeline. Two user-facing changes:
+without touching the retrieval pipeline. Four user-facing changes:
 
 1. **`launch.bat`** — click-to-run launcher. Auto-starts Ollama, activates
    the venv, runs uvicorn bound to localhost only, opens the browser.
+   After uvicorn exits, cleans up Ollama if the launcher started it.
 2. **Blood Ravens themed UI** — floating centered chat card, dark gothic
    palette, rotating mottos in the empty state, clickable PDF source chips
    that open the source document at the cited page.
+3. **In-app shutdown** — "Cease Cogitation" button in the header opens a
+   confirmation modal; confirming triggers `POST /shutdown` which exits
+   the server. A full-screen farewell state ("The Cogitator is at Rest")
+   renders before the connection drops.
+4. **Inquiry Telemetry panel** — a subordinate side panel (hidden below
+   1240px) that surfaces the retrieval internals per query: extracted
+   filters, which of the three retrieval tiers fired, candidate vs
+   selected chunk counts, unique tomes consulted, model name, output
+   token estimate, and session-level totals. Designed for technical-demo
+   visibility — every query lights up the tier that fired so the
+   three-tier fallback strategy is visible without narration.
 
 ## Files changed
 

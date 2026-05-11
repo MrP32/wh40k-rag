@@ -30,9 +30,16 @@ del "%TEMP%\ollama_check.txt" >NUL 2>&1
 
 if "!OLLAMA_STATUS!"=="200" (
     echo        Ollama is already running.
+    REM Make sure no stale marker file exists from a previous run
+    if exist ".ollama_started_by_us" del ".ollama_started_by_us" >NUL 2>&1
 ) else (
     echo        Ollama not detected. Starting it...
     start "Ollama" /min cmd /c "ollama serve"
+
+    REM Drop a marker file so we know we started Ollama and should stop it
+    REM after uvicorn exits. If Ollama was already running, we don't write
+    REM this and we leave Ollama alone on shutdown.
+    echo started > ".ollama_started_by_us"
 
     REM Poll for Ollama to come up (15s timeout)
     set OLLAMA_READY=0
@@ -92,13 +99,35 @@ call ".venv\Scripts\activate.bat"
 REM --- 4. Launch uvicorn + open browser ---------------------------------------
 echo  [4/4] Starting the Librarius on http://127.0.0.1:8000 ...
 echo.
-echo        ---  Close this window to stop the server  ---
+echo        ---  Use the shutdown button in the app to exit  ---
 echo.
 
 REM Open browser after a short delay so uvicorn has time to bind the port
 start "" /b cmd /c "timeout /t 3 /nobreak >NUL & start http://127.0.0.1:8000"
 
-REM Bind to 127.0.0.1 explicitly so we don't accidentally expose to the LAN
+REM Bind to 127.0.0.1 explicitly so we don't accidentally expose to the LAN.
+REM This call blocks until uvicorn exits (either via the in-app shutdown
+REM button or because the user closed this window).
 uvicorn main:app --host 127.0.0.1 --port 8000
+
+REM --- 5. Cleanup -------------------------------------------------------------
+echo.
+echo  ============================================================
+echo    Shutting down...
+echo  ============================================================
+
+if exist ".ollama_started_by_us" (
+    echo  Stopping Ollama ^(we started it, so we stop it^)...
+    taskkill /F /IM ollama.exe >NUL 2>&1
+    del ".ollama_started_by_us" >NUL 2>&1
+    echo  Ollama stopped.
+) else (
+    echo  Leaving Ollama running ^(it was running before we started^).
+)
+
+echo.
+echo  Knowledge is power. Guard it well.
+echo.
+timeout /t 3 /nobreak >NUL
 
 endlocal

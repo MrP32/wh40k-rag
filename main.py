@@ -1,5 +1,8 @@
 import os
 import json
+import signal
+import threading
+import time
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -200,12 +203,17 @@ Return ONLY valid JSON. No preamble, no code fences, no explanation.
 """
 
 
-def extract_filters(query: str) -> dict:
+def extract_filters(query: str) -> tuple[dict, dict]:
     """
     Use Claude to extract metadata filters from a natural-language query.
-    Returns a ChromaDB `where` dict or {} on any failure / no extractable
-    fields. Never raises.
+
+    Returns a (where, raw) tuple:
+      where -- ChromaDB-formatted filter dict, or {} on failure / no fields.
+      raw   -- the raw extracted fields keyed by name (used for telemetry).
+
+    Never raises.
     """
+    raw: dict = {}
     try:
         resp = anthropic_client.messages.create(
             model=MODEL,
@@ -214,22 +222,24 @@ def extract_filters(query: str) -> dict:
         )
         data = json.loads(resp.content[0].text.strip())
     except Exception:
-        return {}
+        return {}, raw
 
     if not isinstance(data, dict):
-        return {}
+        return {}, raw
 
     filters = []
     for field in ("subject", "doc_type", "patrol_name", "munitorum_faction"):
         val = data.get(field)
         if isinstance(val, str) and val.strip():
-            filters.append({field: {"$eq": val.strip().lower()}})
+            normalized = val.strip().lower()
+            filters.append({field: {"$eq": normalized}})
+            raw[field] = normalized
 
     if not filters:
-        return {}
+        return {}, raw
     if len(filters) == 1:
-        return filters[0]
-    return {"$and": filters}
+        return filters[0], raw
+    return {"$and": filters}, raw
 
 
 def _subject_from_filter(where: dict) -> str | None:
@@ -269,26 +279,38 @@ def search_context(query: str):
       2. subject-only filter — if tier 1 returns nothing
       3. unfiltered          — if tiers 1-2 return nothing
 
-    Returns (context_string, source_records) where source_records is a list of
-    dicts: { "filename": str, "page": int, "section": str }
+    Returns (context_string, source_records, telemetry) where
+      source_records is a list of { "filename": str, "page": int, "section": str }
+      telemetry is a dict of routing/timing info for the UI panel.
     """
-    where = extract_filters(query)
+    where, raw_filters = extract_filters(query)
+
+    tier_fired = None
+    candidates: list = []
+    metas: list = []
 
     # Tier 1: exact
-    chunks, metas = _chroma_query(query, where) if where else _chroma_query(query, None)
+    if where:
+        candidates, metas = _chroma_query(query, where)
+        if candidates:
+            tier_fired = 1
 
     # Tier 2: subject-only
-    if not chunks and where:
+    if not candidates and where:
         subject = _subject_from_filter(where)
         if subject:
-            chunks, metas = _chroma_query(query, {"subject": {"$eq": subject}})
+            candidates, metas = _chroma_query(query, {"subject": {"$eq": subject}})
+            if candidates:
+                tier_fired = 2
 
     # Tier 3: unfiltered
-    if not chunks:
-        chunks, metas = _chroma_query(query, None)
+    if not candidates:
+        candidates, metas = _chroma_query(query, None)
+        if candidates:
+            tier_fired = 3
 
     # Drop tiny noise chunks; cap to N_FINAL most relevant
-    filtered = [(c, m) for c, m in zip(chunks, metas) if len(c.split()) >= 5][:N_FINAL]
+    filtered = [(c, m) for c, m in zip(candidates, metas) if len(c.split()) >= 5][:N_FINAL]
 
     context = "\n\n".join(
         f"[{(m.get('source') or 'unknown')}]\n{c}" for c, m in filtered
@@ -307,13 +329,22 @@ def search_context(query: str):
             seen[key] = {"filename": fname, "page": page, "section": section}
     sources = list(seen.values())
 
-    return context, sources
+    telemetry = {
+        "filters": raw_filters,
+        "tier_fired": tier_fired,
+        "candidates": len(candidates),
+        "selected": len(filtered),
+        "unique_tomes": len(sources),
+    }
+
+    return context, sources, telemetry
 
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
     user_message = request.messages[-1]["content"]
-    context, sources = search_context(user_message)
+    t_start = time.perf_counter()
+    context, sources, telemetry = search_context(user_message)
 
     system_prompt = f"""You are a Warhammer 40,000 rules expert assistant.
 Answer using only the context provided below. If the answer is not in the context, say so clearly.
@@ -323,14 +354,28 @@ CONTEXT:
 {context}"""
 
     def stream():
+        output_chars = 0
         with anthropic_client.messages.stream(
             model=MODEL, max_tokens=MAX_TOKENS,
             system=system_prompt, messages=request.messages,
         ) as s:
             for text in s.text_stream:
+                output_chars += len(text)
                 yield f"data: {json.dumps({'text': text})}\n\n"
-        # Emit sources after the answer completes so the UI can render them
+
+        # Compute final telemetry now that generation is done. Token count
+        # is approximate (chars / 4 is the conventional rough estimate);
+        # we surface it as "~N tokens" in the UI to be honest about that.
+        duration_ms = int((time.perf_counter() - t_start) * 1000)
+        telemetry["duration_ms"] = duration_ms
+        telemetry["model"] = MODEL
+        telemetry["output_tokens"] = f"~{max(1, output_chars // 4)}"
+
+        # Emit sources first, then telemetry, then DONE. Order matters only
+        # for renderer simplicity — the UI handles both fields whichever
+        # arrives first.
         yield f"data: {json.dumps({'sources': sources})}\n\n"
+        yield f"data: {json.dumps({'telemetry': telemetry})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
@@ -374,6 +419,34 @@ async def db_info():
     all_meta = collection.get(include=["metadatas"])
     sources = sorted({m.get("source", "unknown") for m in all_meta["metadatas"]})
     return {"total_chunks": total, "sources": sources}
+
+
+@app.post("/shutdown")
+async def shutdown():
+    """
+    Graceful shutdown triggered by the in-app shutdown button.
+
+    We return a 200 response immediately, then schedule the actual process
+    exit on a background thread with a short delay. This gives the browser
+    time to receive the response and render the goodbye state before the
+    connection drops.
+
+    The launcher (launch.bat) detects the uvicorn exit and runs its own
+    cleanup — stopping Ollama if it started it.
+    """
+    def _delayed_exit():
+        time.sleep(0.5)
+        # SIGTERM gives uvicorn a chance to close gracefully on POSIX.
+        # On Windows, signal.SIGTERM behaves like SIGINT and uvicorn
+        # handles it. Fallback to os._exit if signals are unavailable
+        # for any reason.
+        try:
+            os.kill(os.getpid(), signal.SIGTERM)
+        except Exception:
+            os._exit(0)
+
+    threading.Thread(target=_delayed_exit, daemon=True).start()
+    return {"status": "shutting_down"}
 
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
