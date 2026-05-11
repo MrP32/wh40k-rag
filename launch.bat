@@ -59,17 +59,21 @@ if "!OLLAMA_STATUS!"=="200" (
 
 REM --- 2. Verify embedding model is pulled ------------------------------------
 echo  [2/4] Checking nomic-embed-text model...
-ollama list | findstr /C:"nomic-embed-text" >NUL
-if errorlevel 1 (
-    echo        Model not found. Pulling nomic-embed-text (this is a one-time download)...
+ollama list > "%TEMP%\ollama_models.txt" 2>NUL
+findstr /C:"nomic-embed-text" "%TEMP%\ollama_models.txt" >NUL
+set MODEL_FOUND=%errorlevel%
+del "%TEMP%\ollama_models.txt" >NUL 2>&1
+
+if "%MODEL_FOUND%"=="0" (
+    echo        Model is present.
+) else (
+    echo        Model not found. Pulling nomic-embed-text ^(this is a one-time download^)...
     ollama pull nomic-embed-text
     if errorlevel 1 (
         echo  [ERROR] Failed to pull nomic-embed-text.
         pause
         exit /b 1
     )
-) else (
-    echo        Model is present.
 )
 
 REM --- 3. Activate virtual environment ----------------------------------------
