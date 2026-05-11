@@ -1,8 +1,9 @@
 import os
 import json
-from fastapi import FastAPI
+from pathlib import Path
+from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -11,13 +12,16 @@ from chromadb.utils.embedding_functions import OllamaEmbeddingFunction
 
 load_dotenv()
 
-# Config — loaded from .env (see .env.example for template)
-CHROMA_PATH     = os.getenv("CHROMA_PATH",     r"C:\Projects\wh40k-app\chroma_db")
+# ─── Config — loaded from .env (see .env.example for template) ───────────────
+CHROMA_PATH = os.getenv("CHROMA_PATH", r"C:\Projects\wh40k-app\chroma_db")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "warhammer40k")
-OLLAMA_URL      = os.getenv("OLLAMA_URL",      "http://127.0.0.1:11434/api/embeddings")
-OLLAMA_MODEL    = os.getenv("OLLAMA_MODEL",    "nomic-embed-text")
-N_RESULTS       = 40
-N_FINAL         = 8
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434/api/embeddings")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "nomic-embed-text")
+PDF_FOLDER = os.getenv("PDF_FOLDER", r"C:\Personal Projects\warhammer_40k_pdfs")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-6")
+
+N_RESULTS = 40
+N_FINAL = 8
 
 embedding_fn = OllamaEmbeddingFunction(
     url=OLLAMA_URL,
@@ -25,19 +29,21 @@ embedding_fn = OllamaEmbeddingFunction(
 )
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-collection    = chroma_client.get_collection(
+collection = chroma_client.get_collection(
     name=COLLECTION_NAME,
     embedding_function=embedding_fn
 )
 
 anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL      = "claude-sonnet-4-6"
+MODEL = ANTHROPIC_MODEL
 MAX_TOKENS = 1024
 
 app = FastAPI()
 
+
 class ChatRequest(BaseModel):
     messages: list[dict]
+
 
 FILTER_PROMPT = """You are a metadata extractor for a Warhammer 40,000 rules database.
 Extract structured search filters from the user's query and return them as JSON.
@@ -56,20 +62,20 @@ rulebook, or document-type signal.
 =============================================================================
 AVAILABLE doc_type VALUES — pick the ONE that best matches
 =============================================================================
-  combat_patrol            a specific named combat patrol box
-  combat_patrol_rules      the universal combat patrol rulebook
-  faction_pack             a faction's rules (detachments, stratagems, datasheets)
-  core_rules               the main core rules
-  core_rules_updates       rolling patch document to core rules
-  core_rules_quickstart    beginner's short rules
-  points_costs             the Munitorum Field Manual (points for all factions)
-  balance_dataslate        the rolling balance patch
-  crusade_rules            narrative/campaign rules
-  boarding_actions_rules   boarding-actions game mode
-  tournament_rules         Chapter Approved / Pariah Nexus tournament packs
-  imperial_armour          Imperial Armour / Forge World rules
-  army_roster              army roster templates
-  other                    anything else
+combat_patrol            a specific named combat patrol box
+combat_patrol_rules      the universal combat patrol rulebook
+faction_pack             a faction's rules (detachments, stratagems, datasheets)
+core_rules               the main core rules
+core_rules_updates       rolling patch document to core rules
+core_rules_quickstart    beginner's short rules
+points_costs             the Munitorum Field Manual (points for all factions)
+balance_dataslate        the rolling balance patch
+crusade_rules            narrative/campaign rules
+boarding_actions_rules   boarding-actions game mode
+tournament_rules         Chapter Approved / Pariah Nexus tournament packs
+imperial_armour          Imperial Armour / Forge World rules
+army_roster              army roster templates
+other                    anything else
 
 =============================================================================
 AVAILABLE subject VALUES — always lowercase, always the codex faction
@@ -78,23 +84,23 @@ NEVER use sub-chapters like 'ultramarines', 'raven guard', 'iron hands',
 'salamanders', 'white scars', 'imperial fists' — those all roll up to
 'space marines'.
 
-  space marines, grey knights, blood angels, dark angels, black templars,
-  space wolves, deathwatch, adepta sororitas, adeptus custodes,
-  adeptus mechanicus, astra militarum, imperial knights, imperial agents,
-  chaos space marines, death guard, thousand sons, world eaters,
-  emperor's children, chaos knights, chaos daemons, aeldari, drukhari,
-  genestealer cults, leagues of votann, necrons, orks, t'au empire, tyranids,
-  core rules, munitorum field manual, balance dataslate, combat patrol rules,
-  crusade rules, boarding actions
+space marines, grey knights, blood angels, dark angels, black templars,
+space wolves, deathwatch, adepta sororitas, adeptus custodes,
+adeptus mechanicus, astra militarum, imperial knights, imperial agents,
+chaos space marines, death guard, thousand sons, world eaters,
+emperor's children, chaos knights, chaos daemons, aeldari, drukhari,
+genestealer cults, leagues of votann, necrons, orks, t'au empire, tyranids,
+core rules, munitorum field manual, balance dataslate, combat patrol rules,
+crusade rules, boarding actions
 
 =============================================================================
 OUTPUT FIELDS (all optional)
 =============================================================================
-  doc_type           from the doc_type list above
-  subject            from the subject list above
-  patrol_name        ONLY for a specific named combat patrol box, e.g.
+doc_type             from the doc_type list above
+subject              from the subject list above
+patrol_name          ONLY for a specific named combat patrol box, e.g.
                      "aurellios banishers". Use together with subject.
-  munitorum_faction  ONLY for points-cost queries; the faction whose points
+munitorum_faction    ONLY for points-cost queries; the faction whose points
                      the user wants, e.g. "grey knights"
 
 =============================================================================
@@ -131,6 +137,7 @@ UNIT-BY-NAME queries — set subject if the unit is unambiguous.
 =============================================================================
 EXAMPLES — showing PHRASING VARIANTS for the same underlying intent
 =============================================================================
+
 Points costs (all these must extract both doc_type AND munitorum_faction):
   "Points cost for a Leman Russ"
     -> {"doc_type": "points_costs", "munitorum_faction": "astra militarum"}
@@ -192,6 +199,7 @@ Genuinely generic — these return {}:
 Return ONLY valid JSON. No preamble, no code fences, no explanation.
 """
 
+
 def extract_filters(query: str) -> dict:
     """
     Use Claude to extract metadata filters from a natural-language query.
@@ -201,7 +209,7 @@ def extract_filters(query: str) -> dict:
     try:
         resp = anthropic_client.messages.create(
             model=MODEL,
-            max_tokens=300,   # bumped from 200 for the expanded filter prompt
+            max_tokens=300,
             messages=[{"role": "user", "content": f"{FILTER_PROMPT}\n\nQuery: {query}"}]
         )
         data = json.loads(resp.content[0].text.strip())
@@ -211,8 +219,6 @@ def extract_filters(query: str) -> dict:
     if not isinstance(data, dict):
         return {}
 
-    # Build one $eq clause per extracted field. Field names here must match
-    # the metadata keys written by ingest.py's flatten_chunk_metadata().
     filters = []
     for field in ("subject", "doc_type", "patrol_name", "munitorum_faction"):
         val = data.get(field)
@@ -224,6 +230,7 @@ def extract_filters(query: str) -> dict:
     if len(filters) == 1:
         return filters[0]
     return {"$and": filters}
+
 
 def _subject_from_filter(where: dict) -> str | None:
     """Pull the subject value out of a filter dict, whether flat or nested in $and."""
@@ -255,12 +262,15 @@ def _chroma_query(query: str, where):
             r.get("metadatas", [[]])[0] or [])
 
 
-def search_context(query: str) -> str:
+def search_context(query: str):
     """
     Retrieve context for the query using a three-tier fallback:
       1. exact filter        — best precision
       2. subject-only filter — if tier 1 returns nothing
       3. unfiltered          — if tiers 1-2 return nothing
+
+    Returns (context_string, source_records) where source_records is a list of
+    dicts: { "filename": str, "page": int, "section": str }
     """
     where = extract_filters(query)
 
@@ -279,14 +289,32 @@ def search_context(query: str) -> str:
 
     # Drop tiny noise chunks; cap to N_FINAL most relevant
     filtered = [(c, m) for c, m in zip(chunks, metas) if len(c.split()) >= 5][:N_FINAL]
-    return "\n\n".join(
+
+    context = "\n\n".join(
         f"[{(m.get('source') or 'unknown')}]\n{c}" for c, m in filtered
     )
+
+    # Build deduplicated source records for the UI. Use Path().name so the
+    # raw filesystem path stored in 'source' is reduced to just the PDF name.
+    seen = {}
+    for _, m in filtered:
+        raw = m.get("source") or "unknown"
+        fname = Path(raw).name if raw != "unknown" else "unknown"
+        page = int(m.get("page_number") or 0)
+        section = (m.get("section_identifier_clean") or m.get("section_identifier") or "").strip()
+        key = (fname, page)
+        if key not in seen:
+            seen[key] = {"filename": fname, "page": page, "section": section}
+    sources = list(seen.values())
+
+    return context, sources
+
 
 @app.post("/chat")
 async def chat(request: ChatRequest):
     user_message = request.messages[-1]["content"]
-    context      = search_context(user_message)
+    context, sources = search_context(user_message)
+
     system_prompt = f"""You are a Warhammer 40,000 rules expert assistant.
 Answer using only the context provided below. If the answer is not in the context, say so clearly.
 Always cite the source PDF name when referencing rules or stats.
@@ -301,15 +329,51 @@ CONTEXT:
         ) as s:
             for text in s.text_stream:
                 yield f"data: {json.dumps({'text': text})}\n\n"
+        # Emit sources after the answer completes so the UI can render them
+        yield f"data: {json.dumps({'sources': sources})}\n\n"
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 
+
+@app.get("/pdf/{filename}")
+async def get_pdf(filename: str):
+    """
+    Serve a PDF from PDF_FOLDER inline so the browser renders it natively.
+    Path-traversal protection: only the leaf filename is honored, and the
+    resolved path must stay under PDF_FOLDER.
+    """
+    # Reject anything that looks like a path. We only accept a leaf filename.
+    if "/" in filename or "\\" in filename or ".." in filename:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    base = Path(PDF_FOLDER).resolve()
+    target = (base / filename).resolve()
+
+    # Defence in depth: make sure resolved path is still under PDF_FOLDER
+    try:
+        target.relative_to(base)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+
+    if not target.exists() or not target.is_file():
+        raise HTTPException(status_code=404, detail="PDF not found")
+    if target.suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="Not a PDF")
+
+    return FileResponse(
+        target,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{filename}"'},
+    )
+
+
 @app.get("/db-info")
 async def db_info():
-    total    = collection.count()
+    total = collection.count()
     all_meta = collection.get(include=["metadatas"])
-    sources  = sorted({m.get("source", "unknown") for m in all_meta["metadatas"]})
+    sources = sorted({m.get("source", "unknown") for m in all_meta["metadatas"]})
     return {"total_chunks": total, "sources": sources}
+
 
 app.mount("/", StaticFiles(directory="static", html=True), name="static")
