@@ -32,28 +32,10 @@ embedding_fn = OllamaEmbeddingFunction(
 )
 
 chroma_client = chromadb.PersistentClient(path=CHROMA_PATH)
-
-
-def get_collection():
-    """
-    Resolve the Chroma collection by name on every call.
-
-    We deliberately do NOT cache a collection object at module scope. A cached
-    handle pins the collection's internal UUID, so if the collection is ever
-    rebuilt out-of-process (ingestion script, manual reset, deleting the
-    chroma_db folder) the running server keeps asking for a UUID that no
-    longer exists and every request 500s until restart.
-
-    get_or_create_collection is a cheap in-memory lookup against the client's
-    registry, so doing it per request adds no meaningful latency. As a bonus,
-    using *or_create* means the server still boots cleanly on a fresh install
-    where the collection has not been ingested yet — /db-info will just
-    report zero chunks instead of the process failing at import.
-    """
-    return chroma_client.get_or_create_collection(
-        name=COLLECTION_NAME,
-        embedding_function=embedding_fn,
-    )
+collection = chroma_client.get_collection(
+    name=COLLECTION_NAME,
+    embedding_function=embedding_fn
+)
 
 anthropic_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 MODEL = ANTHROPIC_MODEL
@@ -280,11 +262,10 @@ def _subject_from_filter(where: dict) -> str | None:
 def _chroma_query(query: str, where):
     """Run one ChromaDB query. Returns (chunks, metas) — possibly empty."""
     try:
-        coll = get_collection()
         if where:
-            r = coll.query(query_texts=[query], n_results=N_RESULTS, where=where)
+            r = collection.query(query_texts=[query], n_results=N_RESULTS, where=where)
         else:
-            r = coll.query(query_texts=[query], n_results=N_RESULTS)
+            r = collection.query(query_texts=[query], n_results=N_RESULTS)
     except Exception:
         return [], []
     return (r.get("documents", [[]])[0] or [],
@@ -434,9 +415,8 @@ async def get_pdf(filename: str):
 
 @app.get("/db-info")
 async def db_info():
-    coll = get_collection()
-    total = coll.count()
-    all_meta = coll.get(include=["metadatas"])
+    total = collection.count()
+    all_meta = collection.get(include=["metadatas"])
     sources = sorted({m.get("source", "unknown") for m in all_meta["metadatas"]})
     return {"total_chunks": total, "sources": sources}
 
