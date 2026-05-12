@@ -117,8 +117,18 @@ FACTION_NAMES = [
 
 # Compile once. Each pattern anchors to line boundaries and requires the
 # line to contain ONLY the faction name (optionally surrounded by whitespace).
+# A faction header line may appear in any of these forms:
+#   "GREY KNIGHTS"                       (Forge World / Legends sections)
+#   "CODEX: GREY KNIGHTS"                (main faction sections)
+#   "CODEX SUPPLEMENT DARK ANGELS"       (sub-chapter sections)
+#   "CODEX SUPPLEMENT: BLOOD ANGELS"     (sub-chapter, variant punctuation)
+# Note that the PDF extractor sometimes collapses the newline between
+# the "CODEX:" prefix and the faction name, so we cannot rely on the
+# faction name being alone on its line. The regex below accepts both.
+_FACTION_HEADER_PREFIX = r"(?:CODEX\s+SUPPLEMENT:?\s+|CODEX:?\s+)?"
+
 _FACTION_PATTERNS = [
-    (name, re.compile(rf"^\s*{re.escape(name.upper())}\s*$"))
+    (name, re.compile(rf"^\s*{_FACTION_HEADER_PREFIX}{re.escape(name.upper())}\s*$"))
     for name in FACTION_NAMES
 ]
 
