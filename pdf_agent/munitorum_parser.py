@@ -154,26 +154,29 @@ def detect_faction_in_text(text: str) -> Optional[str]:
     Check if the FIRST FEW LINES of the chunk contain exactly one faction
     header. Returns the canonical lowercase name, or None.
 
-    Logic:
+    Logic (v3):
       1. Pull the first HEADER_LINES_TO_INSPECT non-empty lines.
-      2. If the FIRST line is body content (keyword banner, points row),
-         this chunk has no header at the top — return None.
-         (This handles the middle-of-section case.)
-      3. Check each inspected line against faction patterns.
-      4. Require exactly one match; reject if zero or multiple matched.
+      2. Check each inspected line against faction patterns.
+      3. Require exactly one match across those lines.
+
+    Why no body-content guard:
+      v2 bailed out if the first line looked like body content. But real
+      section headers in the Munitorum routinely share chunks with the
+      first few unit rows of their section (e.g. "CODEX: GREY KNIGHTS"
+      followed immediately by "Brother-Captain ... 90 pts"). The body
+      guard caused these chunks to inherit the *previous* faction's label,
+      producing the 'Dark Angels labels on Grey Knights chunks' bug.
+
+      The faction-name regex (^\s*NAME\s*$) already requires a faction
+      name to be alone on its own line, which is the main false-positive
+      protection. Removing the body guard relies on that regex doing its
+      job.
     """
     if not text:
         return None
 
     header_lines = _candidate_header_lines(text)
     if not header_lines:
-        return None
-
-    # If the very first line is already body content, there's no header here.
-    # This is what rejects "FACTION KEYWORDS: GREY KNIGHTS" or "Brother-Captain
-    # Stern 1 model 90 pts" at the top of a chunk without blocking legitimate
-    # "GREY KNIGHTS" headers that happen to have unit-row lines right after.
-    if _is_body_line(header_lines[0]):
         return None
 
     matches = []
@@ -186,7 +189,6 @@ def detect_faction_in_text(text: str) -> Optional[str]:
     if len(matches) != 1:
         return None
     return matches[0]
-
 
 def tag_chunks_with_faction(chunks: list) -> list:
     """
