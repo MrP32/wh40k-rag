@@ -18,3 +18,13 @@ AnalysisResults/
 
 # Test artifacts
 *.bak
+
+# Database backups
+chroma_db_backup_*/
+
+# Test run artifacts
+test_runs/
+wide_sweep_*.txt
+
+# Files parked for later review
+archive/
